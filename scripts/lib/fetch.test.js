@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { fetchFieldDefinitions } from './fetch.js';
+import { fetchFieldDefinitions, fetchEntityDefinitions, parseDuration } from './fetch.js';
 
 // Mock @salesforce/core so no real Salesforce connection is made.
 vi.mock('@salesforce/core', () => {
@@ -36,6 +36,22 @@ function buildMockConnection(entityRecords, fieldRecords) {
   };
 }
 
+/**
+ * Build a minimal mock Salesforce connection for entity-only queries.
+ * @param {object[]} entityRecords - Records returned for EntityDefinition query.
+ */
+function buildEntityMockConnection(entityRecords) {
+  const tooling = {
+    query: vi.fn().mockResolvedValue({ records: entityRecords, done: true, nextRecordsUrl: null }),
+    queryMore: vi.fn(),
+  };
+
+  return {
+    instanceUrl: 'https://example.my.salesforce.com',
+    tooling,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
 });
@@ -60,6 +76,11 @@ describe('fetchFieldDefinitions', () => {
 
     expect(result.instanceUrl).toBe('https://example.my.salesforce.com');
     expect(result.records).toEqual(fieldRecords);
+
+    const fieldQuery = mockConn.tooling.query.mock.calls[1][0];
+    expect(fieldQuery).toContain(
+      'SELECT Id, DurableId, QualifiedApiName, EntityDefinitionId, NamespacePrefix, DeveloperName, MasterLabel, Label, DataType, IsCalculated, IsNillable, IsIndexed, IsApiFilterable, IsApiGroupable, IsApiSortable'
+    );
   });
 
   it('calls AuthInfo.create and Connection.create with the given username', async () => {
@@ -129,6 +150,47 @@ describe('fetchFieldDefinitions', () => {
     expect(result.records).toContainEqual(contactField);
   });
 
+  it('uses only requested select fields when field list is provided', async () => {
+    const entityRecords = [{ DurableId: 'Account' }];
+    const fieldRecords = [{ Id: 'aaa000', EntityDefinitionId: 'Account' }];
+
+    const mockConn = buildMockConnection(entityRecords, fieldRecords);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchFieldDefinitions('user@example.com', 'all', ['Id', 'EntityDefinitionId']);
+
+    const fieldQuery = mockConn.tooling.query.mock.calls[1][0];
+    expect(fieldQuery).toContain('SELECT Id, EntityDefinitionId FROM FieldDefinition');
+    expect(fieldQuery).not.toContain('QualifiedApiName');
+  });
+
+  it('throws when requested fields include unsupported names', async () => {
+    await expect(fetchFieldDefinitions('user@example.com', 'all', ['Id', 'UnknownField']))
+      .rejects
+      .toThrow('Unsupported field name: UnknownField.');
+  });
+
+  it('throws when requested fields include invalid characters', async () => {
+    await expect(fetchFieldDefinitions('user@example.com', 'all', ['Id', 'Name, DurableId']))
+      .rejects
+      .toThrow('Invalid field name: Name, DurableId.');
+  });
+
+  it('deduplicates requested fields while preserving order', async () => {
+    const entityRecords = [{ DurableId: 'Account' }];
+    const fieldRecords = [{ Id: 'aaa000', EntityDefinitionId: 'Account' }];
+
+    const mockConn = buildMockConnection(entityRecords, fieldRecords);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchFieldDefinitions('user@example.com', 'all', ['Id', 'Id', 'EntityDefinitionId']);
+
+    const fieldQuery = mockConn.tooling.query.mock.calls[1][0];
+    expect(fieldQuery).toContain('SELECT Id, EntityDefinitionId FROM FieldDefinition');
+  });
+
   it('follows queryMore for EntityDefinition pagination', async () => {
     const firstPage = [{ DurableId: 'Account' }];
     const secondPage = [{ DurableId: 'Contact' }];
@@ -186,6 +248,332 @@ describe('isValidDurableId (via fetchFieldDefinitions)', () => {
     const result = await fetchFieldDefinitions('user@example.com');
     // No valid entity IDs, so no FieldDefinition query should be made.
     expect(mockConn.tooling.query).toHaveBeenCalledTimes(1);
+    expect(result.records).toEqual([]);
+  });
+});
+
+describe('object scope filtering', () => {
+  it('keeps only system objects when scope is system', async () => {
+    // The WHERE clause filters at the SOQL level; mock returns only system objects.
+    const entityRecords = [{ DurableId: 'Account' }];
+    const systemField = { Id: 'aaa000', EntityDefinitionId: 'Account' };
+
+    const mockConn = buildMockConnection(entityRecords, [systemField]);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchFieldDefinitions('user@example.com', 'system');
+
+    // EntityDefinition query must use NOT (...LIKE...) to exclude custom objects.
+    const entityQuery = mockConn.tooling.query.mock.calls[0][0];
+    expect(entityQuery).toContain("NOT (DurableId LIKE '%\\_\\_%')");
+
+    const fieldQuery = mockConn.tooling.query.mock.calls[1][0];
+    expect(fieldQuery).toContain("'Account'");
+    expect(fieldQuery).not.toContain('MyObject__c');
+  });
+
+  it('keeps only custom objects when scope is custom', async () => {
+    // The WHERE clause filters at the SOQL level; mock returns only custom objects.
+    const entityRecords = [{ DurableId: 'MyObject__c' }];
+    const customField = { Id: 'bbb111', EntityDefinitionId: 'MyObject__c' };
+
+    const mockConn = buildMockConnection(entityRecords, [customField]);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchFieldDefinitions('user@example.com', 'custom');
+
+    // EntityDefinition query must use LIKE to include only custom objects.
+    const entityQuery = mockConn.tooling.query.mock.calls[0][0];
+    expect(entityQuery).toContain("LIKE '%\\_\\_%'");
+    expect(entityQuery).not.toContain('NOT (');
+
+    const fieldQuery = mockConn.tooling.query.mock.calls[1][0];
+    expect(fieldQuery).toContain('MyObject__c');
+  });
+
+  it('does not add a WHERE clause to the EntityDefinition query when scope is all', async () => {
+    const entityRecords = [{ DurableId: 'Account' }];
+    const mockConn = buildMockConnection(entityRecords, []);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchFieldDefinitions('user@example.com', 'all');
+
+    const entityQuery = mockConn.tooling.query.mock.calls[0][0];
+    expect(entityQuery).not.toContain('LIKE');
+    expect(entityQuery).not.toContain('WHERE');
+  });
+
+  it('throws an error for unsupported object scope', async () => {
+    await expect(fetchFieldDefinitions('user@example.com', 'unsupported'))
+      .rejects
+      .toThrow('Invalid object scope: unsupported. Use one of: all, system, custom.');
+  });
+});
+
+describe('parseDuration', () => {
+  it.each([
+    ['1week', 7 * 24 * 60 * 60 * 1000],
+    ['2weeks', 14 * 24 * 60 * 60 * 1000],
+    ['1w', 7 * 24 * 60 * 60 * 1000],
+    ['3days', 3 * 24 * 60 * 60 * 1000],
+    ['1day', 24 * 60 * 60 * 1000],
+    ['1d', 24 * 60 * 60 * 1000],
+    ['12hours', 12 * 60 * 60 * 1000],
+    ['1hour', 60 * 60 * 1000],
+    ['1h', 60 * 60 * 1000],
+    ['30min', 30 * 60 * 1000],
+    ['5mins', 5 * 60 * 1000],
+    ['1minute', 60 * 1000],
+    ['10minutes', 10 * 60 * 1000],
+    ['2DAYS', 2 * 24 * 60 * 60 * 1000],
+    ['6Hours', 6 * 60 * 60 * 1000],
+    ['2 days', 2 * 24 * 60 * 60 * 1000],
+  ])('parses "%s" into %d ms', (input, expected) => {
+    expect(parseDuration(input)).toBe(expected);
+  });
+
+  it.each([
+    [''],
+    ['2'],
+    ['days'],
+    ['1sec'],
+    ['-1days'],
+    ['1.5days'],
+  ])('throws for invalid input "%s"', (input) => {
+    expect(() => parseDuration(input)).toThrow('Invalid duration');
+  });
+});
+
+describe('updatedWithin filtering', () => {
+  it('adds a LastModifiedDate condition to the EntityDefinition query', async () => {
+    const entityRecords = [{ DurableId: 'Account' }];
+    const fieldRecords = [{ Id: 'aaa000', EntityDefinitionId: 'Account' }];
+
+    const mockConn = buildMockConnection(entityRecords, fieldRecords);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchFieldDefinitions('user@example.com', 'all', undefined, '24hours');
+
+    const entityQuery = mockConn.tooling.query.mock.calls[0][0];
+    expect(entityQuery).toContain('LastModifiedDate >=');
+    expect(entityQuery).toContain('WHERE');
+  });
+
+  it('uses a datetime no more than the specified duration in the past', async () => {
+    const entityRecords = [{ DurableId: 'Account' }];
+    const fieldRecords = [{ Id: 'aaa000', EntityDefinitionId: 'Account' }];
+
+    const mockConn = buildMockConnection(entityRecords, fieldRecords);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    const before = Date.now();
+    await fetchFieldDefinitions('user@example.com', 'all', undefined, '24hours');
+    const after = Date.now();
+
+    const entityQuery = mockConn.tooling.query.mock.calls[0][0];
+    const match = entityQuery.match(/LastModifiedDate >= (\S+)/);
+    expect(match).not.toBeNull();
+
+    const cutoff = new Date(match[1]).getTime();
+    const expectedMin = before - 24 * 60 * 60 * 1000 - 1000; // allow up to 1 s because toSoqlDateTimeLiteral truncates ms to second precision
+    const expectedMax = after - 24 * 60 * 60 * 1000;
+    expect(cutoff).toBeGreaterThanOrEqual(expectedMin);
+    expect(cutoff).toBeLessThanOrEqual(expectedMax);
+  });
+
+  it('combines scope and date filters with AND', async () => {
+    const entityRecords = [{ DurableId: 'MyObject__c' }];
+    const fieldRecords = [{ Id: 'bbb111', EntityDefinitionId: 'MyObject__c' }];
+
+    const mockConn = buildMockConnection(entityRecords, fieldRecords);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchFieldDefinitions('user@example.com', 'custom', undefined, '2days');
+
+    const entityQuery = mockConn.tooling.query.mock.calls[0][0];
+    expect(entityQuery).toContain("DurableId LIKE '%\\_\\_%'");
+    expect(entityQuery).toContain('LastModifiedDate >=');
+    expect(entityQuery).toContain(' AND ');
+  });
+
+  it('omits LastModifiedDate filter when updatedWithin is not provided', async () => {
+    const entityRecords = [{ DurableId: 'Account' }];
+    const mockConn = buildMockConnection(entityRecords, []);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchFieldDefinitions('user@example.com', 'all');
+
+    const entityQuery = mockConn.tooling.query.mock.calls[0][0];
+    expect(entityQuery).not.toContain('LastModifiedDate');
+  });
+
+  it('omits LastModifiedDate filter when updatedWithin is an empty string', async () => {
+    const entityRecords = [{ DurableId: 'Account' }];
+    const mockConn = buildMockConnection(entityRecords, []);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchFieldDefinitions('user@example.com', 'all', undefined, '');
+
+    const entityQuery = mockConn.tooling.query.mock.calls[0][0];
+    expect(entityQuery).not.toContain('LastModifiedDate');
+  });
+});
+
+describe('fetchEntityDefinitions', () => {
+  it('returns instanceUrl and entity records', async () => {
+    const entityRecords = [
+      {
+        DurableId: 'Account',
+        QualifiedApiName: 'Account',
+        Label: 'Account',
+        PluralLabel: 'Accounts',
+        Description: null,
+        DeveloperName: 'Account',
+        NamespacePrefix: null,
+      },
+    ];
+
+    const mockConn = buildEntityMockConnection(entityRecords);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    const result = await fetchEntityDefinitions('user@example.com');
+
+    expect(result.instanceUrl).toBe('https://example.my.salesforce.com');
+    expect(result.records).toEqual(entityRecords);
+  });
+
+  it('selects all default EntityDefinition fields when none are specified', async () => {
+    const mockConn = buildEntityMockConnection([]);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchEntityDefinitions('user@example.com');
+
+    const query = mockConn.tooling.query.mock.calls[0][0];
+    expect(query).toContain('SELECT DurableId, QualifiedApiName, Label, PluralLabel, Description, DeveloperName, NamespacePrefix');
+    expect(query).toContain('FROM EntityDefinition');
+  });
+
+  it('uses only requested select fields when field list is provided', async () => {
+    const mockConn = buildEntityMockConnection([]);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchEntityDefinitions('user@example.com', 'all', ['QualifiedApiName', 'Label', 'Description']);
+
+    const query = mockConn.tooling.query.mock.calls[0][0];
+    expect(query).toContain('SELECT QualifiedApiName, Label, Description FROM EntityDefinition');
+    expect(query).not.toContain('PluralLabel');
+  });
+
+  it('throws when requested fields include unsupported names', async () => {
+    await expect(fetchEntityDefinitions('user@example.com', 'all', ['QualifiedApiName', 'UnknownField']))
+      .rejects
+      .toThrow('Unsupported field name: UnknownField.');
+  });
+
+  it('throws when requested fields include invalid characters', async () => {
+    await expect(fetchEntityDefinitions('user@example.com', 'all', ['Label, Description']))
+      .rejects
+      .toThrow('Invalid field name: Label, Description.');
+  });
+
+  it('deduplicates requested fields while preserving order', async () => {
+    const mockConn = buildEntityMockConnection([]);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchEntityDefinitions('user@example.com', 'all', ['Label', 'Label', 'Description']);
+
+    const query = mockConn.tooling.query.mock.calls[0][0];
+    expect(query).toContain('SELECT Label, Description FROM EntityDefinition');
+  });
+
+  it('throws an error for unsupported object scope', async () => {
+    await expect(fetchEntityDefinitions('user@example.com', 'unsupported'))
+      .rejects
+      .toThrow('Invalid object scope: unsupported. Use one of: all, system, custom.');
+  });
+
+  it('adds a scope WHERE clause for custom objects', async () => {
+    const mockConn = buildEntityMockConnection([]);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchEntityDefinitions('user@example.com', 'custom');
+
+    const query = mockConn.tooling.query.mock.calls[0][0];
+    expect(query).toContain("WHERE DurableId LIKE '%\\_\\_%'");
+  });
+
+  it('adds a scope WHERE clause for system objects', async () => {
+    const mockConn = buildEntityMockConnection([]);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchEntityDefinitions('user@example.com', 'system');
+
+    const query = mockConn.tooling.query.mock.calls[0][0];
+    expect(query).toContain("WHERE NOT (DurableId LIKE '%\\_\\_%')");
+  });
+
+  it('adds a LastModifiedDate condition when updatedWithin is provided', async () => {
+    const mockConn = buildEntityMockConnection([]);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    await fetchEntityDefinitions('user@example.com', 'all', undefined, '24hours');
+
+    const query = mockConn.tooling.query.mock.calls[0][0];
+    expect(query).toContain('LastModifiedDate >=');
+    expect(query).toContain('WHERE');
+  });
+
+  it('follows queryMore for EntityDefinition pagination', async () => {
+    const firstPage = [{ DurableId: 'Account', QualifiedApiName: 'Account', Label: 'Account', PluralLabel: 'Accounts', Description: null, DeveloperName: 'Account', NamespacePrefix: null }];
+    const secondPage = [{ DurableId: 'Contact', QualifiedApiName: 'Contact', Label: 'Contact', PluralLabel: 'Contacts', Description: null, DeveloperName: 'Contact', NamespacePrefix: null }];
+
+    const mockConn = {
+      instanceUrl: 'https://example.my.salesforce.com',
+      tooling: {
+        query: vi.fn().mockResolvedValueOnce({
+          records: firstPage,
+          done: false,
+          nextRecordsUrl: '/services/data/v60.0/query/next',
+        }),
+        queryMore: vi.fn().mockResolvedValueOnce({
+          records: secondPage,
+          done: true,
+          nextRecordsUrl: null,
+        }),
+      },
+    };
+
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    const result = await fetchEntityDefinitions('user@example.com');
+
+    expect(mockConn.tooling.queryMore).toHaveBeenCalledTimes(1);
+    expect(result.records).toHaveLength(2);
+  });
+
+  it('returns an empty records array when there are no EntityDefinitions', async () => {
+    const mockConn = buildEntityMockConnection([]);
+    AuthInfo.create.mockResolvedValue({});
+    Connection.create.mockResolvedValue(mockConn);
+
+    const result = await fetchEntityDefinitions('user@example.com');
+
     expect(result.records).toEqual([]);
   });
 });

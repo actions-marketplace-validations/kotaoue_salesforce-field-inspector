@@ -9,7 +9,10 @@
     "fetch-field-definitions:json": "node scripts/fetch-field-definitions.js json",
     "fetch-field-definitions:csv": "node scripts/fetch-field-definitions.js csv",
     "fetch-field-definitions:json-per-object": "node scripts/fetch-field-definitions.js json-per-object",
-    "fetch-field-definitions:csv-per-object": "node scripts/fetch-field-definitions.js csv-per-object"
+    "fetch-field-definitions:csv-per-object": "node scripts/fetch-field-definitions.js csv-per-object",
+    "fetch-field-definitions:package-xml": "node scripts/fetch-field-definitions.js package-xml",
+    "fetch-entity-definitions:json": "node scripts/fetch-entity-definitions.js json",
+    "fetch-entity-definitions:csv": "node scripts/fetch-entity-definitions.js csv"
   },
   "dependencies": {
     "@salesforce/core": "^8.27.0"
